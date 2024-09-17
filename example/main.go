@@ -7,14 +7,14 @@ import (
 	"os"
 	"path/filepath"
 
-	ort "github.com/yalue/onnxruntime_go"
+	"github.com/nfnt/resize"
 	cls "github.com/yasamari/go-image-cls"
 )
 
 const dirPath = "images"
 
 func main() {
-	cls.InitOnnxRuntime("/usr/lib/libonnxruntime.so")
+	cls.InitOnnxRuntime("onnxruntime-linux-x64-1.19.0/lib/libonnxruntime.so.1.19.0")
 
 	c, err := loadClassifier()
 	if err != nil {
@@ -26,52 +26,57 @@ func main() {
 		panic(err)
 	}
 
-	topLabels, err := c.Run(images)
+	outputs, err := c.Run(images)
 	if err != nil {
 		panic(err)
 	}
 
-	for i, label := range topLabels {
-		fmt.Println(imagePaths[i], label)
+	labelProbs := outputs[0].Label()
+
+	for i, l := range labelProbs {
+		label, prob := l.Get()
+		fmt.Println(imagePaths[i], label, prob)
 	}
 }
 
 func loadClassifier() (*cls.Classifier, error) {
-	opt, err := ort.NewSessionOptions()
-	if err != nil {
-		return nil, err
-	}
-	defer opt.Destroy()
+	size := 384
 
-	cudaOpt, err := ort.NewCUDAProviderOptions()
-	if err != nil {
-		return nil, err
-	}
-	defer cudaOpt.Destroy()
-
-	err = opt.AppendExecutionProviderCUDA(cudaOpt)
-	if err != nil {
-		return nil, err
-	}
-
-	c, err := cls.NewClassifier(&cls.ClassifierConfig{
-		ModelPath:      "model.onnx",
-		InputName:      "input",
-		OutputName:     "output",
-		Size:           384,
-		OutputDim:      2,
-		SessionOptions: opt,
-		Labels: []string{
-			"monochrome",
-			"normal",
+	//https://hf.co/deepghs/monochrome_detect
+	modelConf := &cls.ModelConfig{
+		ModelPath: "model.onnx",
+		InputName: "input",
+		Outputs: []cls.OutputConfig{
+			{
+				Name: "output",
+				Dim:  2,
+				Labels: []string{
+					"monochrome",
+					"normal",
+				},
+			},
 		},
-		Shape: cls.ShapeBCHW,
-		Preprocess: cls.PreprocessConfig{
-			ColorFormat: cls.FormatRGB,
-			Normalize:   true,
-			Padding:     false,
+		Shape: cls.NewBCHW(size),
+	}
+
+	preprocessConf := &cls.PreprocessConfig{
+		ColorFormatFunc: cls.ColorFormatRGB,
+		ProcessImageFuncs: []cls.ProcessImageFunc{
+			cls.ResizeImage(size, resize.Bilinear),
 		},
-	})
+		ProcessFloatImageFuncs: []cls.ProcessFloatImageFunc{
+			cls.Rescale(),
+			cls.Normalize(0.5, 0.5),
+		},
+	}
+
+	sessionConf := &cls.SessionConfig{
+		InterOpNumThreads: 4,
+		IntraOpNumThreads: 4,
+	}
+
+	c, err := cls.NewClassifier(modelConf, preprocessConf, sessionConf)
+
 	if err != nil {
 		return nil, err
 	}
