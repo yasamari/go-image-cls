@@ -4,110 +4,108 @@ import (
 	"errors"
 	"fmt"
 	"image"
-	"image/color"
-	"image/draw"
 
-	"github.com/nfnt/resize"
 	ort "github.com/yalue/onnxruntime_go"
 )
 
-type ClassifierConfig struct {
-	ModelPath             string
-	InputName, OutputName string
-	Size                  int
-	OutputDim             int
-	SessionOptions        *ort.SessionOptions
-	Labels                []string
-	Shape
-	Preprocess PreprocessConfig
-}
-
-type PreprocessConfig struct {
-	ColorFormat
-	Normalize    bool
-	Padding      bool
-	PaddingColor color.Gray16
-}
-
 type Classifier struct {
-	conf    *ClassifierConfig
-	session *ort.DynamicAdvancedSession
+	modelConf      *ModelConfig
+	preprocessConf *PreprocessConfig
+	session        *ort.DynamicAdvancedSession
+	opts           *ort.SessionOptions
 }
 
-func NewClassifier(conf *ClassifierConfig) (*Classifier, error) {
-	session, err := ort.NewDynamicAdvancedSession(conf.ModelPath, []string{conf.InputName}, []string{conf.OutputName}, conf.SessionOptions)
-	if err != nil {
-		return nil, fmt.Errorf("Error load model: %w", err)
-	}
-	return &Classifier{
-		conf:    conf,
-		session: session,
-	}, nil
+type LabelProb struct {
+	label string
+	prob  float32
 }
 
-func (c *Classifier) preprocessImages(images []image.Image) ([]float32, error) {
-	conf := &c.conf.Preprocess
-	size := c.conf.Size
-	var resizedImages []image.Image
-	for _, img := range images {
-		if conf.Padding {
-			img = resize.Thumbnail(uint(size), uint(size), img, resize.Bicubic)
-			canvas := image.NewRGBA(image.Rect(0, 0, size, size))
-			draw.Draw(canvas, canvas.Bounds(), image.NewUniform(conf.PaddingColor), image.Point{}, draw.Over)
-
-			offsetX := (size - img.Bounds().Dx()) / 2
-			offsetY := (size - img.Bounds().Dy()) / 2
-			draw.Draw(canvas, img.Bounds().Add(image.Point{offsetX, offsetY}), img, image.Point{}, draw.Over)
-			img = canvas
-		} else {
-			img = resize.Resize(uint(size), uint(size), img, resize.Bilinear)
-		}
-		resizedImages = append(resizedImages, img)
-	}
-	return imageToFloat32(resizedImages, c.conf.Shape, conf.ColorFormat, conf.Normalize)
+func (l *LabelProb) Get() (string, float32) {
+	return l.label, l.prob
 }
 
-func (c *Classifier) Run(images []image.Image) ([]string, error) {
-	output, err := c.RunRaw(images)
-	if err != nil {
-		return nil, err
-	}
+type Output struct {
+	data   [][]float32
+	labels []string
+}
 
-	var result []string
+func (o *Output) Raw() [][]float32 {
+	return o.data
+}
 
-	for _, probs := range output {
-		topLabel := c.conf.Labels[0]
-		var topProb float32 = 0.0
-		for i, label := range c.conf.Labels {
+func (o *Output) Label() []*LabelProb {
+	var result []*LabelProb
+	for _, probs := range o.data {
+		topLabel := o.labels[0]
+		var topProb float32
+		for i, label := range o.labels {
 			if probs[i] > topProb {
 				topLabel = label
 				topProb = probs[i]
 			}
 		}
-		result = append(result, topLabel)
+		result = append(result, &LabelProb{
+			label: topLabel,
+			prob:  topProb,
+		})
 	}
+	return result
+}
+
+func NewClassifier(modelConf *ModelConfig, preprocessConf *PreprocessConfig, sessionConf *SessionConfig) (*Classifier, error) {
+	var outputNames []string
+	for _, output := range modelConf.Outputs {
+		outputNames = append(outputNames, output.Name)
+	}
+
+	opts, err := sessionConf.createSessionOptions()
+	if err != nil {
+		return nil, fmt.Errorf("Error create session options: %w", err)
+	}
+
+	session, err := ort.NewDynamicAdvancedSession(modelConf.ModelPath, []string{modelConf.InputName}, outputNames, opts)
+	if err != nil {
+		return nil, fmt.Errorf("Error load model: %w", err)
+	}
+	return &Classifier{
+		modelConf:      modelConf,
+		preprocessConf: preprocessConf,
+		session:        session,
+		opts:           opts,
+	}, nil
+}
+
+func (c *Classifier) Close() {
+	c.session.Destroy()
+	c.opts.Destroy()
+}
+
+func (c *Classifier) Run(images []image.Image) ([]*Output, error) {
+	outputs, err := c.RunRaw(images)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []*Output
+	for idx, outputConf := range c.modelConf.Outputs {
+		result = append(result, &Output{
+			data:   outputs[idx],
+			labels: outputConf.Labels,
+		})
+	}
+
 	return result, nil
 }
 
-func (c *Classifier) RunRaw(images []image.Image) ([][]float32, error) {
+func (c *Classifier) RunRaw(images []image.Image) ([][][]float32, error) {
 	input, err := c.preprocessImages(images)
 	if err != nil {
 		return nil, err
 	}
 
-	size := int64(c.conf.Size)
-	batch := int64(len(images))
+	batch := len(images)
 
-	var inputShape ort.Shape
-
-	switch c.conf.Shape {
-	case ShapeBCHW:
-		inputShape = ort.NewShape(batch, 3, size, size)
-	case ShapeBHWC:
-		inputShape = ort.NewShape(batch, size, size, 3)
-	default:
-		return nil, errors.New("invalid shape")
-	}
+	inputShape := c.modelConf.Shape.Get(batch)
 
 	inputTensor, err := ort.NewTensor(inputShape, input)
 	if err != nil {
@@ -115,24 +113,35 @@ func (c *Classifier) RunRaw(images []image.Image) ([][]float32, error) {
 	}
 	defer inputTensor.Destroy()
 
-	outputShape := ort.NewShape(batch, int64(c.conf.OutputDim))
-	outputTensor, err := ort.NewEmptyTensor[float32](outputShape)
-	if err != nil {
-		return nil, fmt.Errorf("Error create output tensor: %w", err)
+	var outputTensors []ort.ArbitraryTensor
+	for _, output := range c.modelConf.Outputs {
+		outputShape := ort.NewShape(int64(batch), int64(output.Dim))
+		outputTensor, err := ort.NewEmptyTensor[float32](outputShape)
+		if err != nil {
+			return nil, fmt.Errorf("Error create output tensor: %w", err)
+		}
+		defer outputTensor.Destroy()
+		outputTensors = append(outputTensors, outputTensor)
 	}
-	defer outputTensor.Destroy()
 
-	err = c.session.Run([]ort.ArbitraryTensor{inputTensor}, []ort.ArbitraryTensor{outputTensor})
+	err = c.session.Run([]ort.ArbitraryTensor{inputTensor}, outputTensors)
 	if err != nil {
 		return nil, fmt.Errorf("Error run inference: %w", err)
 	}
 
-	output := outputTensor.GetData()
-	var result [][]float32
+	var result [][][]float32
 
-	for b := 0; b < int(batch); b++ {
-		result = append(result, output[c.conf.OutputDim*b:c.conf.OutputDim*(b+1)])
+	for idx, output := range c.modelConf.Outputs {
+		var tensorResult [][]float32
+		outputTensor, ok := outputTensors[idx].(*ort.Tensor[float32])
+		if !ok {
+			return nil, errors.New("assert ort.ArbitraryTensor not ok")
+		}
+		data := outputTensor.GetData()
+		for b := 0; b < int(batch); b++ {
+			tensorResult = append(tensorResult, data[output.Dim*b:output.Dim*(b+1)])
+		}
+		result = append(result, tensorResult)
 	}
-
 	return result, nil
 }

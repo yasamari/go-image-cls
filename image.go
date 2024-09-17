@@ -1,74 +1,44 @@
 package cls
 
 import (
-	"errors"
-	"fmt"
 	"image"
+	"image/color"
+	"image/draw"
+
+	"github.com/nfnt/resize"
 )
 
-type Shape int
+type ProcessImageFunc func(img image.Image) image.Image
 
-const (
-	//(batch, height, width, channel)
-	ShapeBHWC Shape = iota
-	// (batch, channel, height, width)
-	ShapeBCHW
-)
+type ProcessFloatImageFunc func(rgb float32) float32
 
-type ColorFormat int
+func ResizeWithPadding(size int, padColor color.Color, interp resize.InterpolationFunction) ProcessImageFunc {
+	return func(img image.Image) image.Image {
+		img = resize.Thumbnail(uint(size), uint(size), img, resize.Bilinear)
+		canvas := image.NewRGBA(image.Rect(0, 0, size, size))
+		draw.Draw(canvas, canvas.Bounds(), image.NewUniform(padColor), image.Point{}, draw.Over)
 
-const (
-	FormatBGR ColorFormat = iota
-	FormatRGB
-)
-
-func imageToFloat32(images []image.Image, shape Shape, color ColorFormat, normalize bool) ([]float32, error) {
-	firstBounds := images[0].Bounds()
-	width, height := firstBounds.Dx(), firstBounds.Dy()
-	for _, img := range images[:1] {
-		if img.Bounds().Dx() != width || img.Bounds().Dy() != height {
-			return nil, fmt.Errorf("all images must have the same dimensions")
-		}
+		offsetX := (size - img.Bounds().Dx()) / 2
+		offsetY := (size - img.Bounds().Dy()) / 2
+		draw.Draw(canvas, img.Bounds().Add(image.Point{offsetX, offsetY}), img, image.Point{}, draw.Over)
+		return canvas
 	}
+}
 
-	batch := len(images)
-	result := make([]float32, batch*height*width*3)
-
-	for n, img := range images {
-		for y := 0; y < height; y++ {
-			for x := 0; x < width; x++ {
-				r, g, b, _ := img.At(x, y).RGBA()
-
-				rFloat := float32(r >> 8)
-				gFloat := float32(g >> 8)
-				bFloat := float32(b >> 8)
-
-				if normalize {
-					rFloat = rFloat / 255.0
-					gFloat = gFloat / 255.0
-					bFloat = bFloat / 255.0
-				}
-
-				first, second, third := rFloat, gFloat, bFloat
-				if color == FormatBGR {
-					first, second, third = bFloat, gFloat, rFloat
-				}
-
-				switch shape {
-				case ShapeBCHW:
-					result[n*3*height*width+0*height*width+y*width+x] = first
-					result[n*3*height*width+1*height*width+y*width+x] = second
-					result[n*3*height*width+2*height*width+y*width+x] = third
-				case ShapeBHWC:
-					index := (n*height*width + y*width + x) * 3
-					result[index] = first
-					result[index+1] = second
-					result[index+2] = third
-				default:
-					return nil, errors.New("invalid shape")
-				}
-			}
-		}
+func ResizeImage(size int, interp resize.InterpolationFunction) ProcessImageFunc {
+	return func(img image.Image) image.Image {
+		return resize.Resize(uint(size), uint(size), img, interp)
 	}
-	return result, nil
+}
+
+func Rescale() ProcessFloatImageFunc {
+	return func(rgb float32) float32 {
+		return rgb / 255.0
+	}
+}
+
+func Normalize(mean, std float32) ProcessFloatImageFunc {
+	return func(rgb float32) float32 {
+		return (rgb - mean) / std
+	}
 }
