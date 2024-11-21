@@ -8,13 +8,16 @@ import (
 	"path/filepath"
 
 	"github.com/nfnt/resize"
+	ort "github.com/yalue/onnxruntime_go"
 	cls "github.com/yasamari/go-image-cls"
 )
 
 const dirPath = "images"
 
 func main() {
-	cls.InitOnnxRuntime("onnxruntime-linux-x64-1.19.0/lib/libonnxruntime.so.1.19.0")
+	ort.SetSharedLibraryPath("onnxruntime-linux-x64-gpu-1.19.0/lib/libonnxruntime.so")
+	ort.InitializeEnvironment()
+	defer ort.DestroyEnvironment()
 
 	c, err := loadClassifier()
 	if err != nil {
@@ -31,11 +34,11 @@ func main() {
 		panic(err)
 	}
 
-	labelProbs := outputs[0].Label()
+	topLabels := outputs[0].TopLabels()
 
-	for i, l := range labelProbs {
-		label, prob := l.Get()
-		fmt.Println(imagePaths[i], label, prob)
+	for idx, label := range topLabels {
+		label, prob := label.Get()
+		fmt.Println(imagePaths[idx], label, prob)
 	}
 }
 
@@ -43,23 +46,17 @@ func loadClassifier() (*cls.Classifier, error) {
 	size := 384
 
 	//https://hf.co/deepghs/monochrome_detect
-	modelConf := &cls.ModelConfig{
+	modelConf := &cls.Config{
 		ModelPath: "model.onnx",
-		InputName: "input",
-		Outputs: []cls.OutputConfig{
-			{
-				Name: "output",
-				Dim:  2,
-				Labels: []string{
-					"monochrome",
-					"normal",
-				},
+		Width:     size,
+		Height:    size,
+		OutputLabels: map[int][]string{
+			0: {
+				"monochrome",
+				"normal",
 			},
 		},
-		Shape: cls.NewBCHW(size),
-	}
-
-	preprocessConf := &cls.PreprocessConfig{
+		Shape:           cls.BCHW,
 		ColorFormatFunc: cls.ColorFormatRGB,
 		ProcessImageFuncs: []cls.ProcessImageFunc{
 			cls.ResizeImage(size, resize.Bilinear),
@@ -75,8 +72,7 @@ func loadClassifier() (*cls.Classifier, error) {
 		IntraOpNumThreads: 4,
 	}
 
-	c, err := cls.NewClassifier(modelConf, preprocessConf, sessionConf)
-
+	c, err := cls.NewClassifier(modelConf, sessionConf)
 	if err != nil {
 		return nil, err
 	}

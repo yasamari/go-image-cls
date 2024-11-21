@@ -6,20 +6,18 @@ import (
 	ort "github.com/yalue/onnxruntime_go"
 )
 
-type ModelConfig struct {
-	ModelPath string
-	InputName string
-	Outputs   []OutputConfig
-	Shape     Shape
-}
+type Shape int
 
-type OutputConfig struct {
-	Name   string
-	Dim    int
-	Labels []string
-}
+const (
+	BCHW = iota
+	BHWC
+)
 
-type PreprocessConfig struct {
+type Config struct {
+	ModelPath              string
+	Width, Height          int
+	OutputLabels           map[int][]string
+	Shape                  Shape
 	ColorFormatFunc        ColorFormatFunc
 	ProcessImageFuncs      []ProcessImageFunc
 	ProcessFloatImageFuncs []ProcessFloatImageFunc

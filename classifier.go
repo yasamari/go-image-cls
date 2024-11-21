@@ -1,7 +1,6 @@
 package cls
 
 import (
-	"errors"
 	"fmt"
 	"image"
 
@@ -9,10 +8,9 @@ import (
 )
 
 type Classifier struct {
-	modelConf      *ModelConfig
-	preprocessConf *PreprocessConfig
-	session        *ort.DynamicAdvancedSession
-	opts           *ort.SessionOptions
+	conf                  *Config
+	session               *ort.DynamicAdvancedSession
+	inputInfo, outputInfo []ort.InputOutputInfo
 }
 
 type LabelProb struct {
@@ -33,51 +31,70 @@ func (o *Output) Raw() [][]float32 {
 	return o.data
 }
 
-func (o *Output) Label() []*LabelProb {
-	var result []*LabelProb
+func (o *Output) Labels() [][]*LabelProb {
+	var result [][]*LabelProb
 	for _, probs := range o.data {
-		topLabel := o.labels[0]
-		var topProb float32
-		for i, label := range o.labels {
-			if probs[i] > topProb {
-				topLabel = label
-				topProb = probs[i]
-			}
+		var labelProbs []*LabelProb
+		for idx, prob := range probs {
+			label := o.labels[idx]
+			labelProbs = append(labelProbs, &LabelProb{
+				label: label,
+				prob:  prob,
+			})
 		}
-		result = append(result, &LabelProb{
-			label: topLabel,
-			prob:  topProb,
-		})
+		result = append(result, labelProbs)
 	}
 	return result
 }
 
-func NewClassifier(modelConf *ModelConfig, preprocessConf *PreprocessConfig, sessionConf *SessionConfig) (*Classifier, error) {
+func (o *Output) TopLabels() []*LabelProb {
+	batchLabels := o.Labels()
+	var result []*LabelProb
+	for _, labels := range batchLabels {
+		top := labels[0]
+		for _, l := range labels {
+			if l.prob > top.prob {
+				top = l
+			}
+		}
+		result = append(result, top)
+	}
+	return result
+}
+
+func NewClassifier(conf *Config, sessionConf *SessionConfig) (*Classifier, error) {
+	inputInfo, outputInfo, err := ort.GetInputOutputInfo(conf.ModelPath)
+
+	var inputNames []string
+	for _, info := range inputInfo {
+		inputNames = append(inputNames, info.Name)
+	}
+
 	var outputNames []string
-	for _, output := range modelConf.Outputs {
-		outputNames = append(outputNames, output.Name)
+	for _, info := range outputInfo {
+		outputNames = append(outputNames, info.Name)
 	}
 
 	opts, err := sessionConf.createSessionOptions()
 	if err != nil {
 		return nil, fmt.Errorf("Error create session options: %w", err)
 	}
+	defer opts.Destroy()
 
-	session, err := ort.NewDynamicAdvancedSession(modelConf.ModelPath, []string{modelConf.InputName}, outputNames, opts)
+	session, err := ort.NewDynamicAdvancedSession(conf.ModelPath, inputNames, outputNames, opts)
 	if err != nil {
 		return nil, fmt.Errorf("Error load model: %w", err)
 	}
 	return &Classifier{
-		modelConf:      modelConf,
-		preprocessConf: preprocessConf,
-		session:        session,
-		opts:           opts,
+		conf:       conf,
+		session:    session,
+		inputInfo:  inputInfo,
+		outputInfo: outputInfo,
 	}, nil
 }
 
 func (c *Classifier) Close() {
 	c.session.Destroy()
-	c.opts.Destroy()
 }
 
 func (c *Classifier) Run(images []image.Image) ([]*Output, error) {
@@ -87,10 +104,14 @@ func (c *Classifier) Run(images []image.Image) ([]*Output, error) {
 	}
 
 	var result []*Output
-	for idx, outputConf := range c.modelConf.Outputs {
+	for idx, o := range outputs {
+		labels, ok := c.conf.OutputLabels[idx]
+		if !ok {
+			labels = nil
+		}
 		result = append(result, &Output{
-			data:   outputs[idx],
-			labels: outputConf.Labels,
+			data:   o,
+			labels: labels,
 		})
 	}
 
@@ -103,9 +124,12 @@ func (c *Classifier) RunRaw(images []image.Image) ([][][]float32, error) {
 		return nil, err
 	}
 
-	batch := len(images)
+	batch := int64(len(images))
 
-	inputShape := c.modelConf.Shape.Get(batch)
+	inputShape := []int64{batch, 3, int64(c.conf.Height), int64(c.conf.Width)}
+	if c.conf.Shape == BHWC {
+		inputShape = []int64{batch, int64(c.conf.Height), int64(c.conf.Width), 3}
+	}
 
 	inputTensor, err := ort.NewTensor(inputShape, input)
 	if err != nil {
@@ -114,9 +138,8 @@ func (c *Classifier) RunRaw(images []image.Image) ([][][]float32, error) {
 	defer inputTensor.Destroy()
 
 	var outputTensors []ort.ArbitraryTensor
-	for _, output := range c.modelConf.Outputs {
-		outputShape := ort.NewShape(int64(batch), int64(output.Dim))
-		outputTensor, err := ort.NewEmptyTensor[float32](outputShape)
+	for _, output := range c.outputInfo {
+		outputTensor, err := ort.NewEmptyTensor[float32](ort.NewShape(batch, output.Dimensions[1]))
 		if err != nil {
 			return nil, fmt.Errorf("Error create output tensor: %w", err)
 		}
@@ -131,15 +154,14 @@ func (c *Classifier) RunRaw(images []image.Image) ([][][]float32, error) {
 
 	var result [][][]float32
 
-	for idx, output := range c.modelConf.Outputs {
+	for _, outputValue := range outputTensors {
+		tensor := outputValue.(*ort.Tensor[float32])
 		var tensorResult [][]float32
-		outputTensor, ok := outputTensors[idx].(*ort.Tensor[float32])
-		if !ok {
-			return nil, errors.New("assert ort.ArbitraryTensor not ok")
-		}
-		data := outputTensor.GetData()
+		data := tensor.GetData()
+		labelDim := int(tensor.GetShape()[1])
+
 		for b := 0; b < int(batch); b++ {
-			tensorResult = append(tensorResult, data[output.Dim*b:output.Dim*(b+1)])
+			tensorResult = append(tensorResult, data[labelDim*b:labelDim*(b+1)])
 		}
 		result = append(result, tensorResult)
 	}
